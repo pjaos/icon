@@ -1,0 +1,8 @@
+linux/*.tar.gz
+src/icon/__pycache__/
+tests/__pycache__/
+linux/*.tar.gz
+.pytest_cache/
+./.ropeproject
+# Do not add src/dcon/assets/pyproject.toml to this file
+# or poetry will fail to include this file in the build.

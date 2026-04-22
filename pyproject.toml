@@ -1,0 +1,28 @@
+[project]
+name = "icon"
+version = "0.1.0"
+description = "Internet connection connectivity recorder."
+authors = [
+    {name = "Paul Austen",email = "pjaos@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10.12,<4"
+
+[tool.poetry]
+packages = [{include = "icon", from = "src"}]
+
+[tool.poetry.dependencies]
+pytest = "*"
+nicegui = "^3.10.0"
+p3lib = "^1.1.158"
+rich = "*"
+psutil = "*"
+pillow = "*"
+
+[tool.poetry.scripts]
+icon_db = "icon.icon_db:main"
+icon_gui = "icon.icon_gui:main"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
