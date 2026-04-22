@@ -224,6 +224,19 @@ class _DBPoller(threading.Thread):
 # GUI application class
 # ---------------------------------------------------------------------------
 
+class _ClientState:
+    """Holds all NiceGUI widget references for a single browser connection.
+
+    Each browser tab gets its own _ClientState so widget updates are routed
+    to the correct client rather than overwriting a shared instance reference.
+    """
+    def __init__(self):
+        self.plot:             ui.plotly | None = None
+        self.status_label:     ui.label  | None = None
+        self.plots_container:  ui.column | None = None
+        self.hours:            float             = DEFAULT_HOURS
+
+
 class IConGUI:
     PROGRAM_NAME = "icon"
 
@@ -242,16 +255,12 @@ class IConGUI:
         self._stop_event     = threading.Event()
         self._poller: _DBPoller | None = None
 
-        # Single NiceGUI plot element (one combined chart)
-        self._plot: ui.plotly | None = None
-        self._status_label: ui.label | None = None
-        self._plots_container: ui.column | None = None
-
     # ------------------------------------------------------------------
     # NiceGUI page
     # ------------------------------------------------------------------
 
-    def _empty_figure(self) -> go.Figure:
+    @staticmethod
+    def _empty_figure() -> go.Figure:
         """Return a blank dark figure used to clear the plot after deletion."""
         fig = go.Figure()
         fig.update_layout(
@@ -271,7 +280,7 @@ class IConGUI:
         )
         return fig
 
-    def _delete_all_data(self):
+    def _delete_all_data(self, state: "_ClientState"):
         """Wipe all rows from both tables, then clear the plot in-place."""
         conn = open_db(self._db_path)
         conn.execute("DELETE FROM hop_results")
@@ -281,14 +290,19 @@ class IConGUI:
         # Clear the plot in-place — never delete the widget itself, as
         # re-creating it from a button-click context causes NiceGUI client
         # context issues that prevent the new widget rendering correctly.
-        if self._plot is not None:
-            self._plot.update_figure(self._empty_figure())
-        if self._status_label:
-            self._status_label.set_text("All data deleted — waiting for new data …")
+        if state.plot is not None:
+            state.plot.update_figure(self._empty_figure())
+        if state.status_label:
+            state.status_label.set_text("All data deleted — waiting for new data …")
         self._trigger_refresh()
 
     def _build_page(self):
-        """Define the NiceGUI page layout. Called once at import time via @ui.page."""
+        """Define the NiceGUI page layout. Called for each new browser connection."""
+
+        # Each browser connection gets its own state so widget references
+        # are never shared or overwritten by a second client connecting.
+        state = _ClientState()
+        state.hours = self._hours
 
         ui.dark_mode().enable()
 
@@ -309,11 +323,12 @@ class IConGUI:
                 ui.select(
                     options={1: "1 hour", 6: "6 hours", 24: "24 hours",
                              48: "48 hours", 168: "7 days"},
-                    value=int(self._hours),
-                    on_change=lambda e: self._on_hours_change(e.value),
+                    value=int(state.hours),
+                    on_change=lambda e: self._on_hours_change(e.value, state),
                 ).classes("w-40")
 
-                ui.button("Refresh now", on_click=self._trigger_refresh).props(
+                ui.button("Refresh now",
+                          on_click=lambda: self._trigger_refresh()).props(
                     "color=primary"
                 )
 
@@ -335,7 +350,7 @@ class IConGUI:
                         ui.button(
                             "Yes, delete all",
                             on_click=lambda: (confirm_dialog.close(),
-                                             self._delete_all_data()),
+                                             self._delete_all_data(state)),
                         ).props("color=negative")
 
                 ui.button("Delete all data", on_click=confirm_dialog.open).props(
@@ -343,20 +358,20 @@ class IConGUI:
                 )
 
             # ── Status bar ──────────────────────────────────────────
-            self._status_label = ui.label("Loading …").classes(
+            state.status_label = ui.label("Loading …").classes(
                 "text-sm text-gray-400 italic"
             )
 
             ui.separator()
 
             # ── Plots area ──────────────────────────────────────────
-            self._plots_container = ui.column().classes("w-full gap-4 flex-1").style("min-height: 0;")
+            state.plots_container = ui.column().classes("w-full gap-4 flex-1").style("min-height: 0;")
 
-        # ── 100 ms GUI timer ────────────────────────────────────────
-        ui.timer(TIMER_INTERVAL_S, self._process_queue)
+        # ── 100 ms GUI timer — closure captures this client's state ─
+        ui.timer(TIMER_INTERVAL_S, lambda: self._process_queue(state))
 
-    def _on_hours_change(self, value: int):
-        self._hours = float(value)
+    def _on_hours_change(self, value: int, state: "_ClientState"):
+        state.hours = float(value)
         self._trigger_refresh()
 
     def _trigger_refresh(self):
@@ -376,44 +391,44 @@ class IConGUI:
     # Queue processor (runs on GUI thread, 100 ms tick)
     # ------------------------------------------------------------------
 
-    def _process_queue(self):
+    def _process_queue(self, state: "_ClientState"):
         try:
             while True:                     # drain all pending messages
                 msg = _gui_queue.get_nowait()
                 if msg["type"] == "data":
-                    self._update_plots(msg["records"])
+                    self._update_plots(msg["records"], state)
                 elif msg["type"] == "error":
-                    if self._status_label:
-                        self._status_label.set_text(f"Error: {msg['message']}")
+                    if state.status_label:
+                        state.status_label.set_text(f"Error: {msg['message']}")
         except queue.Empty:
             pass
 
-    def _update_plots(self, records: list[dict]):
+    def _update_plots(self, records: list[dict], state: "_ClientState"):
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        if self._status_label:
+        if state.status_label:
             if records:
-                self._status_label.set_text(
+                state.status_label.set_text(
                     f"Last updated: {now_str}  |  {len(records)} data points"
                 )
             else:
-                self._status_label.set_text(
+                state.status_label.set_text(
                     f"Last updated: {now_str}  |  No data yet — is icon_db running?"
                 )
 
-        if self._plots_container is None:
+        if state.plots_container is None:
             return
 
         fig = _build_figure(records, self._host) if records else self._empty_figure()
 
-        if self._plot is None:
-            # First ever data arrival — create the widget inside the container.
-            # This path is only reached from the ui.timer callback, which always
-            # holds the correct NiceGUI client context.
-            with self._plots_container:
-                self._plot = ui.plotly(fig).classes("w-full h-full")
+        if state.plot is None:
+            # First data arrival for this client — create the widget inside
+            # the container.  Safe here because we are in the ui.timer callback
+            # which always holds the correct NiceGUI client context.
+            with state.plots_container:
+                state.plot = ui.plotly(fig).classes("w-full h-full")
         else:
-            self._plot.update_figure(fig)
+            state.plot.update_figure(fig)
 
     # ------------------------------------------------------------------
     # Start
