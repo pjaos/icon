@@ -139,8 +139,8 @@ def _build_figure(records: list[dict], host: str) -> go.Figure | None:
                 name="No reply" if not unreachable_legend_shown else None,
                 showlegend=not unreachable_legend_shown,
                 legendgroup="no_reply",
-                marker=dict(color=colour, size=16, symbol="x",
-                            line=dict(width=2, color=colour)),
+                marker=dict(color="#F44336", size=16, symbol="x",
+                            line=dict(width=2, color="#F44336")),
                 hovertemplate=f"{trace_name}<br>%{{x}}<br>No reply<extra></extra>",
             ))
             unreachable_legend_shown = True
