@@ -14,7 +14,7 @@ packages = [{include = "icon", from = "src"}]
 [tool.poetry.dependencies]
 pytest = "*"
 nicegui = "^3.10.0"
-p3lib = "^1.1.158"
+p3lib = "^1.1.159"
 rich = "*"
 psutil = "*"
 pillow = "*"

@@ -5,9 +5,11 @@ import argparse
 from p3lib.uio import UIO
 from p3lib.helper import logTraceBack
 from p3lib.boot_manager import BootManager
-from p3lib.pconfig import DotConfigManager
+from p3lib.helper import get_app_data_path
 from p3lib.helper import get_program_version
 from p3lib.launcher import Launcher
+
+from icon.icon_db import MODULE_NAME
 
 class IConDB(object):
     PROGRAM_NAME = "icon"
@@ -18,7 +20,7 @@ class IConDB(object):
            @param options An instance of the OptionParser command line options."""
         self._uio = uio
         self._options = options
-        self._config_folder = DotConfigManager.GetDefaultConfigFilename(filenameOverride=IConDB.PROGRAM_NAME) # All configuration and app data sits in this folder.
+        self._config_folder = get_app_data_path(MODULE_NAME) # All configuration and app data sits in this folder.
 
     def run(self):
         # Implementation required here
