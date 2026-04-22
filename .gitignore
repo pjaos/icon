@@ -4,5 +4,6 @@ tests/__pycache__/
 linux/*.tar.gz
 .pytest_cache/
 ./.ropeproject
+./icon_claude_ai.md
 # Do not add src/dcon/assets/pyproject.toml to this file
 # or poetry will fail to include this file in the build.
