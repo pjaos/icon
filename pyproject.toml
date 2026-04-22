@@ -18,10 +18,18 @@ p3lib = "^1.1.159"
 rich = "*"
 psutil = "*"
 pillow = "*"
+plotly = "*"
 
 [tool.poetry.scripts]
 icon_db = "icon.icon_db:main"
 icon_gui = "icon.icon_gui:main"
+
+[tool.poetry.dev-dependencies]
+pytest = "*"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
