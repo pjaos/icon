@@ -1,6 +1,6 @@
 [project]
 name = "icon"
-version = "0.9.1"
+version = "0.9.8"
 description = "Internet connection connectivity recorder."
 authors = [
     {name = "Paul Austen",email = "pjaos@gmail.com"}
@@ -23,9 +23,6 @@ plotly = "*"
 [tool.poetry.scripts]
 icon_db = "icon.icon_db:main"
 icon_gui = "icon.icon_gui:main"
-
-[tool.poetry.dev-dependencies]
-pytest = "*"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
