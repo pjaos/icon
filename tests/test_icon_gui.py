@@ -35,6 +35,12 @@ from icon.icon_gui import (
     TIMER_INTERVAL_S,
     _build_figure,
     _load_hops_from_db,
+    _load_hosts_from_db,
+    _load_annotations_from_db,
+    _save_annotation,
+    _records_to_csv,
+    _compute_stats,
+    _db_size_str,
     _DBPoller,
 )
 from icon.icon_db import _ensure_schema, open_db, save_traceroute
@@ -48,26 +54,32 @@ def _make_record(hop_number: int, hop_host: str | None,
                  avg_ms: float | None,
                  min_ms: float | None = None,
                  max_ms: float | None = None,
-                 timestamp: str = "2026-04-22 12:00:00") -> dict:
+                 timestamp: str = "2026-04-22 12:00:00",
+                 probe_count: int = 3,
+                 reply_count: int = 3) -> dict:
     return {
-        "timestamp":  timestamp,
-        "hop_number": hop_number,
-        "hop_host":   hop_host,
-        "avg_ms":     avg_ms,
-        "min_ms":     min_ms if min_ms is not None else avg_ms,
-        "max_ms":     max_ms if max_ms is not None else avg_ms,
+        "timestamp":   timestamp,
+        "hop_number":  hop_number,
+        "hop_host":    hop_host,
+        "avg_ms":      avg_ms,
+        "min_ms":      min_ms if min_ms is not None else avg_ms,
+        "max_ms":      max_ms if max_ms is not None else avg_ms,
+        "probe_count": probe_count,
+        "reply_count": reply_count if avg_ms is not None else 0,
     }
 
 
 def _populated_db(tmp_path, host: str = "8.8.8.8") -> str:
-    """Create a real SQLite DB with a couple of traceroute runs and return its path."""
+    """Create a real SQLite DB with a traceroute run and return its path."""
     db_path = str(tmp_path / "icon.db")
     conn = open_db(db_path)
     hops = [
         {"hop_number": 1, "hop_host": "192.168.0.1",
-         "avg_ms": 4.5, "min_ms": 3.8, "max_ms": 5.2},
+         "avg_ms": 4.5, "min_ms": 3.8, "max_ms": 5.2,
+         "probe_count": 3, "reply_count": 3},
         {"hop_number": 2, "hop_host": "8.8.8.8",
-         "avg_ms": 23.1, "min_ms": 22.0, "max_ms": 24.5},
+         "avg_ms": 23.1, "min_ms": 22.0, "max_ms": 24.5,
+         "probe_count": 3, "reply_count": 3},
     ]
     save_traceroute(conn, host, hops)
     conn.close()
@@ -115,7 +127,8 @@ class TestLoadHopsFromDb:
         db_path = _populated_db(tmp_path)
         records = _load_hops_from_db(db_path, "8.8.8.8")
         expected_keys = {"timestamp", "hop_number", "hop_host",
-                         "avg_ms", "min_ms", "max_ms"}
+                         "avg_ms", "min_ms", "max_ms",
+                         "probe_count", "reply_count"}
         assert expected_keys.issubset(records[0].keys())
 
     def test_records_ordered_by_timestamp_then_hop(self, tmp_path):
@@ -127,29 +140,94 @@ class TestLoadHopsFromDb:
     def test_cutoff_filters_old_records(self, tmp_path):
         db_path = str(tmp_path / "icon.db")
         conn = open_db(db_path)
-        # Insert a run with an old timestamp directly
-        old_ts = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime("%Y-%m-%d %H:%M:%S")
+        old_ts = (datetime.now(timezone.utc) - timedelta(hours=48)) \
+                     .strftime("%Y-%m-%d %H:%M:%S")
         conn.execute(
             "INSERT INTO traceroute_runs (timestamp, host) VALUES (?, ?)",
             (old_ts, "8.8.8.8"),
         )
         run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute(
-            "INSERT INTO hop_results (run_id, hop_number, hop_host, avg_ms, min_ms, max_ms)"
-            " VALUES (?,?,?,?,?,?)",
+            "INSERT INTO hop_results "
+            "(run_id, hop_number, hop_host, avg_ms, min_ms, max_ms) "
+            "VALUES (?,?,?,?,?,?)",
             (run_id, 1, "192.168.0.1", 5.0, 4.0, 6.0),
         )
         conn.commit()
         conn.close()
-        # With default 24-hour window the old record must be excluded
         records = _load_hops_from_db(db_path, "8.8.8.8", hours=24)
         assert records == []
 
     def test_recent_records_are_included(self, tmp_path):
         db_path = _populated_db(tmp_path)
         records = _load_hops_from_db(db_path, "8.8.8.8", hours=1)
-        # The records were just inserted so their timestamp is within 1 hour
         assert len(records) == 2
+
+
+# ---------------------------------------------------------------------------
+# _load_hosts_from_db
+# ---------------------------------------------------------------------------
+
+class TestLoadHostsFromDb:
+    def test_returns_empty_when_db_missing(self, tmp_path):
+        assert _load_hosts_from_db(str(tmp_path / "no.db")) == []
+
+    def test_returns_distinct_hosts(self, tmp_path):
+        db_path = str(tmp_path / "icon.db")
+        conn = open_db(db_path)
+        hops = [{"hop_number": 1, "hop_host": None, "avg_ms": 5.0,
+                 "min_ms": 4.0, "max_ms": 6.0,
+                 "probe_count": 3, "reply_count": 3}]
+        save_traceroute(conn, "8.8.8.8", hops)
+        save_traceroute(conn, "1.1.1.1", hops)
+        save_traceroute(conn, "8.8.8.8", hops)  # duplicate — must appear once
+        conn.close()
+        hosts = _load_hosts_from_db(db_path)
+        assert hosts == ["8.8.8.8", "1.1.1.1"]
+
+    def test_hosts_returned_in_insertion_order(self, tmp_path):
+        db_path = str(tmp_path / "icon.db")
+        conn = open_db(db_path)
+        hops = [{"hop_number": 1, "hop_host": None, "avg_ms": 5.0,
+                 "min_ms": 4.0, "max_ms": 6.0,
+                 "probe_count": 3, "reply_count": 3}]
+        for host in ["1.1.1.1", "8.8.8.8", "9.9.9.9"]:
+            save_traceroute(conn, host, hops)
+        conn.close()
+        assert _load_hosts_from_db(db_path) == ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+
+
+# ---------------------------------------------------------------------------
+# _load_annotations_from_db / _save_annotation
+# ---------------------------------------------------------------------------
+
+class TestAnnotations:
+    def test_save_and_load_roundtrip(self, tmp_path):
+        db_path = _populated_db(tmp_path)
+        _save_annotation(db_path, "8.8.8.8", "test note")
+        annotations = _load_annotations_from_db(db_path, "8.8.8.8", hours=1)
+        assert len(annotations) == 1
+        assert annotations[0]["note"] == "test note"
+
+    def test_annotation_has_timestamp_and_note_keys(self, tmp_path):
+        db_path = _populated_db(tmp_path)
+        _save_annotation(db_path, "8.8.8.8", "note")
+        annotations = _load_annotations_from_db(db_path, "8.8.8.8", hours=1)
+        assert {"timestamp", "note"}.issubset(annotations[0].keys())
+
+    def test_annotation_filtered_by_host(self, tmp_path):
+        db_path = _populated_db(tmp_path)
+        _save_annotation(db_path, "8.8.8.8", "for 8.8.8.8")
+        _save_annotation(db_path, "1.1.1.1", "for 1.1.1.1")
+        annotations = _load_annotations_from_db(db_path, "8.8.8.8", hours=1)
+        assert len(annotations) == 1
+        assert annotations[0]["note"] == "for 8.8.8.8"
+
+    def test_empty_when_db_missing(self, tmp_path):
+        result = _load_annotations_from_db(
+            str(tmp_path / "no.db"), "8.8.8.8", hours=24
+        )
+        assert result == []
 
 
 # ---------------------------------------------------------------------------
@@ -158,16 +236,16 @@ class TestLoadHopsFromDb:
 
 class TestBuildFigure:
     def test_returns_none_for_empty_records(self):
-        assert _build_figure([], "8.8.8.8") is None
+        assert _build_figure([], [], "8.8.8.8") is None
 
     def test_returns_plotly_figure(self):
         records = [_make_record(1, "192.168.0.1", 10.0)]
-        fig = _build_figure(records, "8.8.8.8")
+        fig = _build_figure(records, [], "8.8.8.8")
         assert isinstance(fig, go.Figure)
 
     def test_title_contains_host(self):
         records = [_make_record(1, "192.168.0.1", 10.0)]
-        fig = _build_figure(records, "8.8.8.8")
+        fig = _build_figure(records, [], "8.8.8.8")
         assert "8.8.8.8" in fig.layout.title.text
 
     def test_one_rtt_trace_per_hop(self):
@@ -175,31 +253,32 @@ class TestBuildFigure:
             _make_record(1, "192.168.0.1", 5.0),
             _make_record(2, "8.8.8.8",     20.0),
         ]
-        fig = _build_figure(records, "8.8.8.8")
+        fig = _build_figure(records, [], "8.8.8.8")
         rtt_traces = [t for t in fig.data if t.mode == "lines+markers"]
         assert len(rtt_traces) == 2
 
     def test_trace_name_includes_hop_ip(self):
         records = [_make_record(1, "192.168.0.1", 5.0)]
-        fig = _build_figure(records, "8.8.8.8")
+        fig = _build_figure(records, [], "8.8.8.8")
         rtt_traces = [t for t in fig.data if t.mode == "lines+markers"]
         assert "192.168.0.1" in rtt_traces[0].name
 
     def test_trace_name_falls_back_to_hop_number(self):
         records = [_make_record(1, None, 5.0)]
-        fig = _build_figure(records, "8.8.8.8")
+        fig = _build_figure(records, [], "8.8.8.8")
         rtt_traces = [t for t in fig.data if t.mode == "lines+markers"]
         assert "hop 1" in rtt_traces[0].name
 
     def test_unreachable_hop_produces_marker_trace(self):
         records = [_make_record(1, None, None)]
-        fig = _build_figure(records, "8.8.8.8")
+        fig = _build_figure(records, [], "8.8.8.8")
         marker_traces = [t for t in fig.data if t.mode == "markers"]
         assert len(marker_traces) == 1
 
     def test_unreachable_markers_plotted_at_zero(self):
-        records = [_make_record(1, None, None, timestamp="2026-04-22 12:00:00")]
-        fig = _build_figure(records, "8.8.8.8")
+        records = [_make_record(1, None, None,
+                                timestamp="2026-04-22 12:00:00")]
+        fig = _build_figure(records, [], "8.8.8.8")
         marker_traces = [t for t in fig.data if t.mode == "markers"]
         assert all(y == 0 for y in marker_traces[0].y)
 
@@ -208,7 +287,7 @@ class TestBuildFigure:
             _make_record(1, None, None),
             _make_record(2, None, None),
         ]
-        fig = _build_figure(records, "8.8.8.8")
+        fig = _build_figure(records, [], "8.8.8.8")
         no_reply_traces = [t for t in fig.data
                            if getattr(t, "legendgroup", None) == "no_reply"
                            and t.showlegend]
@@ -217,30 +296,27 @@ class TestBuildFigure:
     def test_customdata_contains_min_max(self):
         records = [_make_record(1, "192.168.0.1", avg_ms=10.0,
                                 min_ms=8.0, max_ms=12.0)]
-        fig = _build_figure(records, "8.8.8.8")
+        fig = _build_figure(records, [], "8.8.8.8")
         rtt_traces = [t for t in fig.data if t.mode == "lines+markers"]
         cd = rtt_traces[0].customdata
-        assert cd[0][0] == pytest.approx(8.0)   # min
-        assert cd[0][1] == pytest.approx(12.0)  # max
+        assert cd[0][0] == pytest.approx(8.0)
+        assert cd[0][1] == pytest.approx(12.0)
 
     def test_customdata_falls_back_to_avg_when_min_max_null(self):
-        """Rows migrated from old schema have min_ms=None; fallback must be avg."""
         records = [_make_record(1, "192.168.0.1", avg_ms=10.0,
                                 min_ms=None, max_ms=None)]
-        # Override the min/max to None to simulate old-schema rows
         records[0]["min_ms"] = None
         records[0]["max_ms"] = None
-        fig = _build_figure(records, "8.8.8.8")
+        fig = _build_figure(records, [], "8.8.8.8")
         rtt_traces = [t for t in fig.data if t.mode == "lines+markers"]
         cd = rtt_traces[0].customdata
         assert cd[0][0] == pytest.approx(10.0)
         assert cd[0][1] == pytest.approx(10.0)
 
     def test_colours_cycle_for_more_than_palette_size(self):
-        """More than 8 hops must not raise an IndexError."""
         records = [_make_record(i, f"10.0.0.{i}", float(i * 5))
                    for i in range(1, 12)]
-        fig = _build_figure(records, "8.8.8.8")
+        fig = _build_figure(records, [], "8.8.8.8")
         rtt_traces = [t for t in fig.data if t.mode == "lines+markers"]
         assert len(rtt_traces) == 11
 
@@ -250,21 +326,132 @@ class TestBuildFigure:
             _make_record(2, None,          None),
             _make_record(3, "8.8.8.8",     20.0),
         ]
-        fig = _build_figure(records, "8.8.8.8")
+        fig = _build_figure(records, [], "8.8.8.8")
         rtt_traces    = [t for t in fig.data if t.mode == "lines+markers"]
         marker_traces = [t for t in fig.data if t.mode == "markers"]
         assert len(rtt_traces) == 2
         assert len(marker_traces) == 1
 
     def test_most_recent_ip_used_as_hop_label(self):
-        """When the same hop has appeared with different IPs, the latest wins."""
         records = [
             _make_record(1, "10.0.0.1", 5.0, timestamp="2026-04-22 11:00:00"),
             _make_record(1, "10.0.0.2", 6.0, timestamp="2026-04-22 12:00:00"),
         ]
-        fig = _build_figure(records, "8.8.8.8")
+        fig = _build_figure(records, [], "8.8.8.8")
         rtt_traces = [t for t in fig.data if t.mode == "lines+markers"]
         assert "10.0.0.2" in rtt_traces[0].name
+
+    def test_loss_trace_present_per_hop(self):
+        records = [_make_record(1, "192.168.0.1", 5.0,
+                                probe_count=3, reply_count=2)]
+        fig = _build_figure(records, [], "8.8.8.8")
+        loss_traces = [t for t in fig.data if t.mode == "lines"]
+        assert len(loss_traces) == 1
+
+    def test_loss_values_calculated_correctly(self):
+        # 1 reply out of 3 probes = 66.7% loss
+        records = [_make_record(1, "192.168.0.1", 5.0,
+                                probe_count=3, reply_count=1)]
+        fig = _build_figure(records, [], "8.8.8.8")
+        loss_traces = [t for t in fig.data if t.mode == "lines"]
+        assert loss_traces[0].y[0] == pytest.approx(200.0 / 3, rel=1e-3)
+
+    def test_annotation_shapes_added_to_layout(self):
+        records = [_make_record(1, "192.168.0.1", 5.0)]
+        annotations = [{"timestamp": "2026-04-22 12:00:00", "note": "test"}]
+        fig = _build_figure(records, annotations, "8.8.8.8")
+        assert len(fig.layout.shapes) == 1
+        assert fig.layout.shapes[0].x0 == "2026-04-22 12:00:00"
+
+    def test_no_annotation_shapes_when_empty(self):
+        records = [_make_record(1, "192.168.0.1", 5.0)]
+        fig = _build_figure(records, [], "8.8.8.8")
+        assert len(fig.layout.shapes) == 0
+
+
+# ---------------------------------------------------------------------------
+# _compute_stats
+# ---------------------------------------------------------------------------
+
+class TestComputeStats:
+    def test_one_row_per_hop(self):
+        records = [
+            _make_record(1, "192.168.0.1", 5.0),
+            _make_record(2, "8.8.8.8",     20.0),
+        ]
+        stats = _compute_stats(records)
+        assert len(stats) == 2
+
+    def test_stats_contain_expected_keys(self):
+        records = [_make_record(1, "192.168.0.1", 5.0)]
+        stats = _compute_stats(records)
+        assert {"hop", "host", "samples", "min_ms",
+                "avg_ms", "max_ms", "loss_pct"}.issubset(stats[0].keys())
+
+    def test_loss_pct_computed_correctly(self):
+        # 2 replies out of 4 probes across two records = 50% loss
+        records = [
+            _make_record(1, "192.168.0.1", 5.0,
+                         probe_count=2, reply_count=1),
+            _make_record(1, "192.168.0.1", 6.0,
+                         probe_count=2, reply_count=1),
+        ]
+        stats = _compute_stats(records)
+        assert stats[0]["loss_pct"] == "50.0%"
+
+    def test_zero_loss_when_all_replies(self):
+        records = [_make_record(1, "192.168.0.1", 5.0,
+                                probe_count=3, reply_count=3)]
+        stats = _compute_stats(records)
+        assert stats[0]["loss_pct"] == "0.0%"
+
+    def test_dash_shown_for_no_rtt_data(self):
+        records = [_make_record(1, None, None)]
+        stats = _compute_stats(records)
+        assert stats[0]["avg_ms"] == "—"
+
+
+# ---------------------------------------------------------------------------
+# _records_to_csv
+# ---------------------------------------------------------------------------
+
+class TestRecordsToCsv:
+    def test_csv_has_header_row(self):
+        csv_str = _records_to_csv([_make_record(1, "192.168.0.1", 5.0)])
+        assert "timestamp" in csv_str
+        assert "hop_number" in csv_str
+
+    def test_csv_contains_data(self):
+        records = [_make_record(1, "192.168.0.1", 5.0,
+                                timestamp="2026-04-22 12:00:00")]
+        csv_str = _records_to_csv(records)
+        assert "192.168.0.1" in csv_str
+        assert "2026-04-22 12:00:00" in csv_str
+
+    def test_empty_records_produces_header_only(self):
+        csv_str = _records_to_csv([])
+        lines = [l for l in csv_str.splitlines() if l]
+        assert len(lines) == 1  # header only
+
+
+# ---------------------------------------------------------------------------
+# _db_size_str
+# ---------------------------------------------------------------------------
+
+class TestDbSizeStr:
+    def test_returns_unknown_for_missing_file(self, tmp_path):
+        result = _db_size_str(str(tmp_path / "no.db"))
+        assert result == "unknown"
+
+    def test_returns_kb_for_small_file(self, tmp_path):
+        db_path = _populated_db(tmp_path)
+        result = _db_size_str(db_path)
+        assert "KB" in result or "MB" in result
+
+    def test_returns_mb_for_large_file(self, tmp_path):
+        path = tmp_path / "big.db"
+        path.write_bytes(b"x" * 2_000_000)
+        assert "MB" in _db_size_str(str(path))
 
 
 # ---------------------------------------------------------------------------
@@ -273,15 +460,29 @@ class TestBuildFigure:
 
 class TestDBPoller:
     def test_puts_data_message_on_queue(self, tmp_path):
-        db_path  = _populated_db(tmp_path)
-        q        = queue.Queue()
-        stop     = threading.Event()
-        poller   = _DBPoller(db_path, "8.8.8.8", 24.0, q, stop)
+        db_path = _populated_db(tmp_path)
+        q       = queue.Queue()
+        stop    = threading.Event()
+        poller  = _DBPoller(db_path, "8.8.8.8", 24.0, q, stop)
         poller.start()
         try:
             msg = q.get(timeout=5)
             assert msg["type"] == "data"
             assert isinstance(msg["records"], list)
+        finally:
+            stop.set()
+            poller.join(timeout=2)
+
+    def test_message_includes_hosts_and_annotations(self, tmp_path):
+        db_path = _populated_db(tmp_path)
+        q       = queue.Queue()
+        stop    = threading.Event()
+        poller  = _DBPoller(db_path, "8.8.8.8", 24.0, q, stop)
+        poller.start()
+        try:
+            msg = q.get(timeout=5)
+            assert "hosts" in msg
+            assert "annotations" in msg
         finally:
             stop.set()
             poller.join(timeout=2)
@@ -292,22 +493,18 @@ class TestDBPoller:
         stop    = threading.Event()
         poller  = _DBPoller(db_path, "8.8.8.8", 24.0, q, stop)
         poller.start()
-        q.get(timeout=5)   # wait for first message then stop
+        q.get(timeout=5)
         stop.set()
         poller.join(timeout=5)
         assert not poller.is_alive()
 
     def test_puts_error_message_on_queue_for_bad_db(self, tmp_path):
-        q      = queue.Queue()
-        stop   = threading.Event()
-        # Point at a path that is a directory, not a file — open_db will fail
-        bad_path = str(tmp_path)
-        poller = _DBPoller(bad_path, "8.8.8.8", 24.0, q, stop)
+        q    = queue.Queue()
+        stop = threading.Event()
+        poller = _DBPoller(str(tmp_path), "8.8.8.8", 24.0, q, stop)
         poller.start()
         try:
             msg = q.get(timeout=5)
-            # Either an error message or empty data is acceptable;
-            # what must NOT happen is the thread silently dying
             assert msg["type"] in ("data", "error")
         finally:
             stop.set()

@@ -1,6 +1,6 @@
 [project]
 name = "icon"
-version = "0.9.8"
+version = "0.9.10"
 description = "Internet connection connectivity recorder."
 authors = [
     {name = "Paul Austen",email = "pjaos@gmail.com"}

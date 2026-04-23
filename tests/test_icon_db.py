@@ -8,13 +8,18 @@ from unittest.mock import MagicMock, patch
 from icon.icon_db import (
     DEFAULT_HOST,
     DEFAULT_POLL_SECONDS,
+    DEFAULT_MAX_DAYS,
     DB_FILENAME,
+    ALERT_LOG_FILENAME,
     get_db_path,
+    get_alert_log_path,
     open_db,
     _ensure_schema,
     _hops_ever_replied,
     _parse_traceroute,
     save_traceroute,
+    purge_old_data,
+    AlertState,
     IConDB,
 )
 
@@ -51,7 +56,6 @@ traceroute to 8.8.8.8 (8.8.8.8), 30 hops max, 60 byte packets
  8  8.8.8.8  23.401 ms  22.876 ms  24.123 ms
 """
 
-# Traceroute where the destination itself is unreachable
 UNREACHABLE_TRACEROUTE = """\
 traceroute to 8.8.8.8 (8.8.8.8), 30 hops max, 60 byte packets
  1  192.168.0.1  4.0 ms  4.1 ms  4.0 ms
@@ -59,7 +63,6 @@ traceroute to 8.8.8.8 (8.8.8.8), 30 hops max, 60 byte packets
  3  * * *
 """
 
-# Traceroute with a mix of responding and silent probes on the same hop
 PARTIAL_REPLY_TRACEROUTE = """\
 traceroute to 8.8.8.8 (8.8.8.8), 30 hops max, 60 byte packets
  1  192.168.0.1  4.0 ms  * 5.0 ms
@@ -68,13 +71,17 @@ traceroute to 8.8.8.8 (8.8.8.8), 30 hops max, 60 byte packets
 
 
 # ---------------------------------------------------------------------------
-# get_db_path
+# get_db_path / get_alert_log_path
 # ---------------------------------------------------------------------------
 
-class TestGetDbPath:
-    def test_joins_folder_and_filename(self, tmp_path):
+class TestGetPaths:
+    def test_get_db_path_joins_folder_and_filename(self, tmp_path):
         result = get_db_path(str(tmp_path))
         assert result == str(tmp_path / DB_FILENAME)
+
+    def test_get_alert_log_path_joins_folder_and_filename(self, tmp_path):
+        result = get_alert_log_path(str(tmp_path))
+        assert result == str(tmp_path / ALERT_LOG_FILENAME)
 
 
 # ---------------------------------------------------------------------------
@@ -95,14 +102,14 @@ class TestOpenDb:
         }
         assert "traceroute_runs" in tables
         assert "hop_results" in tables
+        assert "annotations" in tables
 
-    def test_hop_results_has_min_max_columns(self, mem_db):
+    def test_hop_results_has_all_columns(self, mem_db):
         cols = {row[1] for row in mem_db.execute("PRAGMA table_info(hop_results)")}
-        assert "min_ms" in cols
-        assert "max_ms" in cols
+        for col in ("min_ms", "max_ms", "probe_count", "reply_count"):
+            assert col in cols
 
     def test_schema_is_idempotent(self, mem_db):
-        """Calling _ensure_schema twice must not raise or duplicate tables."""
         _ensure_schema(mem_db)
         tables = [
             row[0] for row in
@@ -110,11 +117,20 @@ class TestOpenDb:
         ]
         assert tables.count("traceroute_runs") == 1
         assert tables.count("hop_results") == 1
+        assert tables.count("annotations") == 1
+
+    def test_timestamp_index_exists(self, mem_db):
+        indices = {
+            row[0] for row in
+            mem_db.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+        assert "idx_runs_timestamp" in indices
 
     def test_migration_adds_missing_columns(self, tmp_path):
-        """A pre-existing DB without min_ms/max_ms is migrated transparently."""
+        """A pre-existing DB without new columns is migrated transparently."""
         db_path = str(tmp_path / "legacy.db")
-        # Build old-style schema without min_ms / max_ms
         conn = sqlite3.connect(db_path)
         conn.execute("""
             CREATE TABLE traceroute_runs (
@@ -135,12 +151,11 @@ class TestOpenDb:
         conn.commit()
         conn.close()
 
-        # open_db should migrate without error
         conn = open_db(db_path)
         cols = {row[1] for row in conn.execute("PRAGMA table_info(hop_results)")}
         conn.close()
-        assert "min_ms" in cols
-        assert "max_ms" in cols
+        for col in ("min_ms", "max_ms", "probe_count", "reply_count"):
+            assert col in cols
 
 
 # ---------------------------------------------------------------------------
@@ -166,12 +181,18 @@ class TestParseTraceroute:
 
     def test_silent_hop_has_null_rtt(self, uio):
         hops = _parse_traceroute(SAMPLE_TRACEROUTE, uio)
-        hop2 = hops[1]   # * * *
+        hop2 = hops[1]
         assert hop2["hop_number"] == 2
         assert hop2["avg_ms"] is None
         assert hop2["min_ms"] is None
         assert hop2["max_ms"] is None
         assert hop2["hop_host"] is None
+
+    def test_silent_hop_has_zero_reply_count(self, uio):
+        hops = _parse_traceroute(SAMPLE_TRACEROUTE, uio)
+        hop2 = hops[1]  # * * *
+        assert hop2["reply_count"] == 0
+        assert hop2["probe_count"] == 3
 
     def test_destination_hop_rtt(self, uio):
         hops = _parse_traceroute(SAMPLE_TRACEROUTE, uio)
@@ -181,6 +202,12 @@ class TestParseTraceroute:
         assert last["min_ms"]  == pytest.approx(22.876, rel=1e-3)
         assert last["max_ms"]  == pytest.approx(24.123, rel=1e-3)
 
+    def test_full_reply_hop_has_correct_counts(self, uio):
+        hops = _parse_traceroute(SAMPLE_TRACEROUTE, uio)
+        hop1 = hops[0]
+        assert hop1["probe_count"] == 3
+        assert hop1["reply_count"] == 3
+
     def test_min_lt_avg_lt_max(self, uio):
         hops = _parse_traceroute(SAMPLE_TRACEROUTE, uio)
         for hop in hops:
@@ -188,19 +215,19 @@ class TestParseTraceroute:
                 assert hop["min_ms"] <= hop["avg_ms"] <= hop["max_ms"]
 
     def test_partial_reply_hop(self, uio):
-        """A hop where only some probes reply still computes correct stats."""
         hops = _parse_traceroute(PARTIAL_REPLY_TRACEROUTE, uio)
         hop1 = hops[0]
-        assert hop1["avg_ms"]  == pytest.approx((4.0 + 5.0) / 2, rel=1e-3)
-        assert hop1["min_ms"]  == pytest.approx(4.0, rel=1e-3)
-        assert hop1["max_ms"]  == pytest.approx(5.0, rel=1e-3)
+        assert hop1["avg_ms"]     == pytest.approx((4.0 + 5.0) / 2, rel=1e-3)
+        assert hop1["min_ms"]     == pytest.approx(4.0, rel=1e-3)
+        assert hop1["max_ms"]     == pytest.approx(5.0, rel=1e-3)
+        assert hop1["reply_count"] == 2
+        assert hop1["probe_count"] == 3
 
     def test_empty_output_returns_empty_list(self, uio):
         assert _parse_traceroute("", uio) == []
 
     def test_header_line_is_ignored(self, uio):
         hops = _parse_traceroute(SAMPLE_TRACEROUTE, uio)
-        # The "traceroute to …" header must not appear as a hop
         assert all(isinstance(h["hop_number"], int) for h in hops)
 
 
@@ -250,22 +277,26 @@ class TestHopsEverReplied:
 
 class TestSaveTraceroute:
     def _make_hop(self, hop_number, hop_host=None, avg_ms=10.0,
-                  min_ms=8.0, max_ms=12.0):
+                  min_ms=8.0, max_ms=12.0, probe_count=3, reply_count=3):
         return {
-            "hop_number": hop_number,
-            "hop_host":   hop_host,
-            "avg_ms":     avg_ms,
-            "min_ms":     min_ms,
-            "max_ms":     max_ms,
+            "hop_number":  hop_number,
+            "hop_host":    hop_host,
+            "avg_ms":      avg_ms,
+            "min_ms":      min_ms,
+            "max_ms":      max_ms,
+            "probe_count": probe_count,
+            "reply_count": reply_count,
         }
 
     def _make_silent_hop(self, hop_number):
         return {
-            "hop_number": hop_number,
-            "hop_host":   None,
-            "avg_ms":     None,
-            "min_ms":     None,
-            "max_ms":     None,
+            "hop_number":  hop_number,
+            "hop_host":    None,
+            "avg_ms":      None,
+            "min_ms":      None,
+            "max_ms":      None,
+            "probe_count": 3,
+            "reply_count": 0,
         }
 
     def test_returns_run_id_and_count(self, mem_db):
@@ -281,14 +312,17 @@ class TestSaveTraceroute:
 
     def test_hop_values_are_persisted(self, mem_db):
         hops = [self._make_hop(1, hop_host="192.168.0.1",
-                               avg_ms=10.0, min_ms=8.0, max_ms=12.0)]
+                               avg_ms=10.0, min_ms=8.0, max_ms=12.0,
+                               probe_count=3, reply_count=2)]
         save_traceroute(mem_db, "8.8.8.8", hops)
         row = mem_db.execute("SELECT * FROM hop_results").fetchone()
-        assert row["hop_number"] == 1
-        assert row["hop_host"]   == "192.168.0.1"
-        assert row["avg_ms"]     == pytest.approx(10.0)
-        assert row["min_ms"]     == pytest.approx(8.0)
-        assert row["max_ms"]     == pytest.approx(12.0)
+        assert row["hop_number"]  == 1
+        assert row["hop_host"]    == "192.168.0.1"
+        assert row["avg_ms"]      == pytest.approx(10.0)
+        assert row["min_ms"]      == pytest.approx(8.0)
+        assert row["max_ms"]      == pytest.approx(12.0)
+        assert row["probe_count"] == 3
+        assert row["reply_count"] == 2
 
     def test_always_silent_hop_is_skipped_on_first_run(self, mem_db):
         hops = [self._make_hop(1), self._make_silent_hop(2)]
@@ -298,10 +332,8 @@ class TestSaveTraceroute:
         assert [r[0] for r in rows] == [1]
 
     def test_previously_seen_silent_hop_is_saved(self, mem_db):
-        # First run: hop 2 replies
         save_traceroute(mem_db, "8.8.8.8",
                         [self._make_hop(1), self._make_hop(2)])
-        # Second run: hop 2 goes silent — must be saved to record the loss
         _, count = save_traceroute(mem_db, "8.8.8.8",
                                    [self._make_hop(1), self._make_silent_hop(2)])
         assert count == 2
@@ -318,8 +350,8 @@ class TestSaveTraceroute:
         assert run_id_2 == run_id_1 + 1
 
     def test_different_hosts_are_independent(self, mem_db):
-        save_traceroute(mem_db, "8.8.8.8",  [self._make_hop(1)])
-        save_traceroute(mem_db, "1.1.1.1",  [self._make_hop(1)])
+        save_traceroute(mem_db, "8.8.8.8", [self._make_hop(1)])
+        save_traceroute(mem_db, "1.1.1.1", [self._make_hop(1)])
         runs = mem_db.execute("SELECT host FROM traceroute_runs").fetchall()
         hosts = {r[0] for r in runs}
         assert hosts == {"8.8.8.8", "1.1.1.1"}
@@ -332,13 +364,156 @@ class TestSaveTraceroute:
 
 
 # ---------------------------------------------------------------------------
+# purge_old_data
+# ---------------------------------------------------------------------------
+
+class TestPurgeOldData:
+    def _insert_run(self, conn, host, timestamp):
+        conn.execute(
+            "INSERT INTO traceroute_runs (timestamp, host) VALUES (?, ?)",
+            (timestamp, host),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO hop_results "
+            "(run_id, hop_number, hop_host, avg_ms) VALUES (?,?,?,?)",
+            (run_id, 1, None, 5.0),
+        )
+        conn.commit()
+        return run_id
+
+    def test_old_runs_are_deleted(self, mem_db, uio):
+        from datetime import datetime, timezone, timedelta
+        old_ts  = (datetime.now(timezone.utc) - timedelta(days=40)) \
+                      .strftime("%Y-%m-%d %H:%M:%S")
+        self._insert_run(mem_db, "8.8.8.8", old_ts)
+        deleted = purge_old_data(mem_db, max_days=30, uio=uio)
+        assert deleted == 1
+        assert mem_db.execute(
+            "SELECT COUNT(*) FROM traceroute_runs"
+        ).fetchone()[0] == 0
+
+    def test_recent_runs_are_kept(self, mem_db, uio):
+        from datetime import datetime, timezone, timedelta
+        recent_ts = (datetime.now(timezone.utc) - timedelta(days=5)) \
+                        .strftime("%Y-%m-%d %H:%M:%S")
+        self._insert_run(mem_db, "8.8.8.8", recent_ts)
+        deleted = purge_old_data(mem_db, max_days=30, uio=uio)
+        assert deleted == 0
+        assert mem_db.execute(
+            "SELECT COUNT(*) FROM traceroute_runs"
+        ).fetchone()[0] == 1
+
+    def test_hop_results_are_also_deleted(self, mem_db, uio):
+        from datetime import datetime, timezone, timedelta
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=40)) \
+                     .strftime("%Y-%m-%d %H:%M:%S")
+        self._insert_run(mem_db, "8.8.8.8", old_ts)
+        purge_old_data(mem_db, max_days=30, uio=uio)
+        assert mem_db.execute(
+            "SELECT COUNT(*) FROM hop_results"
+        ).fetchone()[0] == 0
+
+    def test_returns_count_of_deleted_runs(self, mem_db, uio):
+        from datetime import datetime, timezone, timedelta
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=40)) \
+                     .strftime("%Y-%m-%d %H:%M:%S")
+        for _ in range(3):
+            self._insert_run(mem_db, "8.8.8.8", old_ts)
+        deleted = purge_old_data(mem_db, max_days=30, uio=uio)
+        assert deleted == 3
+
+    def test_zero_returned_when_nothing_to_purge(self, mem_db, uio):
+        deleted = purge_old_data(mem_db, max_days=30, uio=uio)
+        assert deleted == 0
+
+
+# ---------------------------------------------------------------------------
+# AlertState
+# ---------------------------------------------------------------------------
+
+class TestAlertState:
+    def _make_hop(self, avg_ms, reply_count=3, probe_count=3):
+        return {
+            "hop_number":  1,
+            "hop_host":    "8.8.8.8",
+            "avg_ms":      avg_ms,
+            "probe_count": probe_count,
+            "reply_count": reply_count,
+        }
+
+    def test_alert_written_on_rtt_breach(self, tmp_path, uio):
+        alert_log = str(tmp_path / "alerts.log")
+        state = AlertState()
+        state.check([self._make_hop(200.0)], "8.8.8.8",
+                    alert_rtt=100.0, alert_loss=None,
+                    alert_log=alert_log, uio=uio)
+        content = open(alert_log).read()
+        assert "ALERT" in content
+
+    def test_recovery_written_on_rtt_recovery(self, tmp_path, uio):
+        alert_log = str(tmp_path / "alerts.log")
+        state = AlertState()
+        # First call: enters alert
+        state.check([self._make_hop(200.0)], "8.8.8.8",
+                    alert_rtt=100.0, alert_loss=None,
+                    alert_log=alert_log, uio=uio)
+        # Second call: recovers
+        state.check([self._make_hop(20.0)], "8.8.8.8",
+                    alert_rtt=100.0, alert_loss=None,
+                    alert_log=alert_log, uio=uio)
+        content = open(alert_log).read()
+        assert "RECOVERED" in content
+
+    def test_no_duplicate_alert_while_sustained(self, tmp_path, uio):
+        alert_log = str(tmp_path / "alerts.log")
+        state = AlertState()
+        for _ in range(3):
+            state.check([self._make_hop(200.0)], "8.8.8.8",
+                        alert_rtt=100.0, alert_loss=None,
+                        alert_log=alert_log, uio=uio)
+        lines = [l for l in open(alert_log).read().splitlines() if l]
+        assert len(lines) == 1  # only one ALERT entry
+
+    def test_alert_written_on_loss_breach(self, tmp_path, uio):
+        alert_log = str(tmp_path / "alerts.log")
+        state = AlertState()
+        # 1 reply out of 3 probes = 66.7% loss
+        state.check([self._make_hop(20.0, reply_count=1, probe_count=3)],
+                    "8.8.8.8",
+                    alert_rtt=None, alert_loss=50.0,
+                    alert_log=alert_log, uio=uio)
+        content = open(alert_log).read()
+        assert "ALERT" in content
+
+    def test_no_alert_when_below_thresholds(self, tmp_path, uio):
+        alert_log = str(tmp_path / "alerts.log")
+        state = AlertState()
+        state.check([self._make_hop(20.0)], "8.8.8.8",
+                    alert_rtt=100.0, alert_loss=50.0,
+                    alert_log=alert_log, uio=uio)
+        import os
+        assert not os.path.exists(alert_log)
+
+    def test_unreachable_destination_triggers_alert(self, tmp_path, uio):
+        alert_log = str(tmp_path / "alerts.log")
+        state = AlertState()
+        state.check([self._make_hop(None)], "8.8.8.8",
+                    alert_rtt=100.0, alert_loss=None,
+                    alert_log=alert_log, uio=uio)
+        content = open(alert_log).read()
+        assert "ALERT" in content
+        assert "unreachable" in content
+
+
+# ---------------------------------------------------------------------------
 # IConDB._check_traceroute
 # ---------------------------------------------------------------------------
 
 class TestCheckTraceroute:
     def test_passes_when_traceroute_found(self):
         with patch("shutil.which", return_value="/usr/bin/traceroute"):
-            IConDB._check_traceroute()   # must not raise
+            IConDB._check_traceroute()
 
     def test_raises_when_traceroute_missing(self):
         with patch("shutil.which", return_value=None):
@@ -368,7 +543,9 @@ class TestRunTraceroute:
 
     def test_returns_empty_list_on_timeout(self, uio):
         import subprocess
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="traceroute", timeout=120)):
+        with patch("subprocess.run",
+                   side_effect=subprocess.TimeoutExpired(
+                       cmd="traceroute", timeout=120)):
             from icon.icon_db import run_traceroute
             result = run_traceroute("8.8.8.8", uio)
         assert result == []
@@ -385,5 +562,11 @@ class TestConstants:
     def test_default_poll_seconds(self):
         assert DEFAULT_POLL_SECONDS == 2.0
 
+    def test_default_max_days(self):
+        assert DEFAULT_MAX_DAYS == 30
+
     def test_db_filename(self):
         assert DB_FILENAME == "icon.db"
+
+    def test_alert_log_filename(self):
+        assert ALERT_LOG_FILENAME == "alerts.log"
